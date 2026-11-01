@@ -1,0 +1,13 @@
+PLUGIN_LANGID
+	EN	LangID
+	DE	LangID
+	FR	LangID
+	NL	LangID
+	SV	LangID
+
+PLUGIN_LANGID_DESC
+	EN	Offline language identification for Lyrion Music Server.
+	DE	Offline-Spracherkennung für den Lyrion Music Server.
+	FR	Identification de langue hors ligne pour Lyrion Music Server.
+	NL	Offline taalherkenning voor Lyrion Music Server.
+	SV	Offline språkidentifiering för Lyrion Music Server.

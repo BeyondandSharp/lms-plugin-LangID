@@ -1,0 +1,75 @@
+#!/usr/bin/env perl
+
+# Fake langid helper used by t/api.t. It implements just enough of the real
+# protocol to exercise the Perl wrapper without building or running the Rust
+# binary. Behaviour is selected with the FAKE_LANGID_MODE environment variable:
+#
+#   normal   (default)  read stdin, print a valid result
+#   crash              print an error to stderr and exit 3
+#   badjson            print text that is not JSON and exit 0
+#   timeout            ignore SIGTERM and sleep (forces TERM then KILL)
+#
+# --languages is answered with a fixed JSON array so languages() can be tested.
+
+use strict;
+use warnings;
+
+use Time::HiRes qw(sleep);
+
+my @arguments = @ARGV;
+
+if ( grep { $_ eq '--languages' } @arguments ) {
+	print qq{["en","ja","ko","zh"]\n};
+	exit 0;
+}
+
+if ( grep { $_ eq '--version' } @arguments ) {
+	print "langid 0.1.0\n";
+	exit 0;
+}
+
+if ( grep { $_ eq '--help' } @arguments ) {
+	print "Usage: langid [OPTIONS] < TEXT\n";
+	exit 0;
+}
+
+my $mode = defined $ENV{FAKE_LANGID_MODE} && length $ENV{FAKE_LANGID_MODE}
+	? $ENV{FAKE_LANGID_MODE}
+	: 'normal';
+
+if ( $mode eq 'crash' ) {
+	print STDERR "fake-langid: simulated crash\n";
+	exit 3;
+}
+
+if ( $mode eq 'badjson' ) {
+	print "this is not json\n";
+	exit 0;
+}
+
+if ( $mode eq 'timeout' ) {
+	# Ignore TERM so the wrapper has to escalate to KILL after its grace
+	# period, exactly as the real timeout path is specified.
+	$SIG{TERM} = 'IGNORE';
+	$SIG{INT}  = 'IGNORE';
+
+	sleep 30;
+
+	exit 0;
+}
+
+if ( $mode eq 'empty' ) {
+	print '{"language":null,"confidence":0,"scores":[]}', "\n";
+	exit 0;
+}
+
+# Normal mode: the wrapper must close stdin, otherwise this read would block
+# until the wrapper's timeout.
+my $input = do { local $/; <STDIN> };
+$input = '' unless defined $input;
+
+print '{"language":"Chinese","iso":"zh","confidence":0.98,"scores":['
+	. '{"language":"Chinese","confidence":0.98},'
+	. '{"language":"English","confidence":0.02}]}', "\n";
+
+exit 0;

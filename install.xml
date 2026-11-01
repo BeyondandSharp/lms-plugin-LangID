@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<extension>
+	<name>PLUGIN_LANGID</name>
+	<creator>LangID contributors</creator>
+	<defaultState>enabled</defaultState>
+	<description>PLUGIN_LANGID_DESC</description>
+	<category>information</category>
+	<module>Plugins::LangID::Plugin</module>
+	<targetApplication>
+		<id>SqueezeCenter</id>
+		<maxVersion>*</maxVersion>
+		<minVersion>8.0</minVersion>
+	</targetApplication>
+	<type>2</type>
+	<version>0.1.0</version>
+</extension>

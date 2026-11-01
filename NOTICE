@@ -1,0 +1,41 @@
+LangID
+Copyright 2026 LangID contributors
+
+This product includes software developed by Peter M. Stahl
+(https://github.com/pemistahl/lingua-rs) and distributed under the
+Apache License, Version 2.0:
+
+  * lingua 1.8.0
+    https://crates.io/crates/lingua
+    https://github.com/pemistahl/lingua-rs
+
+  * lingua-english-language-model 1.3.0
+  * lingua-chinese-language-model 1.3.0
+  * lingua-japanese-language-model 1.3.0
+  * lingua-korean-language-model 1.3.0
+
+Builds made with the `extended` feature set additionally embed the following
+language model crates (all 1.3.0, Apache-2.0):
+
+  * lingua-french-language-model
+  * lingua-german-language-model
+  * lingua-spanish-language-model
+  * lingua-italian-language-model
+  * lingua-portuguese-language-model
+  * lingua-dutch-language-model
+  * lingua-russian-language-model
+  * lingua-polish-language-model
+  * lingua-swedish-language-model
+  * lingua-turkish-language-model
+  * lingua-indonesian-language-model
+  * lingua-vietnamese-language-model
+
+The compiled `langid` helper binary statically links the language model data
+from these crates. Language model data is embedded at build time; no files are
+downloaded or read at run time.
+
+The helper binary also statically links the transitive Rust dependencies listed
+in Cargo.lock. Their licenses (MIT, Apache-2.0, BSD and Unlicense variants) are
+compatible with this project's Apache-2.0 license.
+
+The full text of the Apache License, Version 2.0 is in the LICENSE file.

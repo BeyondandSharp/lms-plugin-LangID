@@ -1,0 +1,66 @@
+[package]
+name = "langid"
+version = "0.1.0"
+edition = "2021"
+description = "Offline language identification for the Lyrion Music Server LangID plugin"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["language-detection", "nlp", "lms", "lyrion"]
+categories = ["text-processing", "command-line-utilities"]
+
+# Language models are compile-time features: each `lang-*` feature forwards to
+# the matching lingua-rs language model crate. Building with
+# `--no-default-features --features lang-en` (for example) produces a much
+# smaller binary by compiling only the requested models.
+[features]
+default = ["lang-zh", "lang-en", "lang-ja", "lang-ko"]
+
+lang-zh = ["lingua/chinese"]
+lang-en = ["lingua/english"]
+lang-ja = ["lingua/japanese"]
+lang-ko = ["lingua/korean"]
+
+lang-fr = ["lingua/french"]
+lang-de = ["lingua/german"]
+lang-es = ["lingua/spanish"]
+lang-it = ["lingua/italian"]
+lang-pt = ["lingua/portuguese"]
+lang-nl = ["lingua/dutch"]
+lang-ru = ["lingua/russian"]
+lang-pl = ["lingua/polish"]
+lang-sv = ["lingua/swedish"]
+lang-tr = ["lingua/turkish"]
+lang-id = ["lingua/indonesian"]
+lang-vi = ["lingua/vietnamese"]
+
+# Convenience feature set: the four East/South-East Asian default languages
+# plus the most common European and South-East Asian languages.
+extended = [
+    "lang-zh",
+    "lang-en",
+    "lang-ja",
+    "lang-ko",
+    "lang-fr",
+    "lang-de",
+    "lang-es",
+    "lang-it",
+    "lang-pt",
+    "lang-nl",
+    "lang-ru",
+    "lang-pl",
+    "lang-sv",
+    "lang-tr",
+    "lang-id",
+    "lang-vi",
+]
+
+[dependencies]
+# Model selection happens exclusively through the features above; the full
+# lingua default set would pull in ~75 model crates and an enormous binary.
+lingua = { version = "1.8.0", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
