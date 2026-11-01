@@ -1,0 +1,31 @@
+# Frozen entry — tag pushes.
+#
+# The orchestration lives in the template repository as a reusable workflow.
+# THIS FILE IS COPIED ONCE AND NEVER EDITED: updating the Action (jobs, steps,
+# programs, images, retry policy, ...) is a change in the template repository.
+# The `uses:` address is intentionally baked in.
+#
+# One file per event because Forgejo expands reusable workflows under the
+# callee's own trigger (`workflow_call`): putting `if: github.event_name == ...`
+# on a `uses:` job makes every expanded job inherit a condition that is false in
+# that context, and the whole run is reported as ignored. Hence no `if` here —
+# the event is expressed by which file runs, and the `mode` input tells the
+# reusable workflow what it is.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+      - '[0-9]*.[0-9]*.[0-9]*'
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: BeyondandSharp/action-template/.forgejo/workflows/release.yml@main
+    secrets: inherit
+    with:
+      mode: tag

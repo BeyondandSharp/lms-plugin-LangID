@@ -22,12 +22,13 @@ scripts/smoke.sh            end-to-end checks for the compiled binary
 API.pm                      Plugins::LangID::API - async wrapper for LMS
 Plugin.pm                   Plugins::LangID::Plugin - LMS plugin entry point
 install.xml                 LMS extension descriptor (PLUGIN_LANGID)
-VERSION                     plugin version (0.1.0)
+VERSION                     plugin version (single source of truth)
 strings.txt                 plugin strings
 t/api.t                     unit tests for the Perl wrapper
 t/fixtures/fake-langid      stand-in binary used by the unit tests
 t/lib/                      minimal AnyEvent shim for the unit tests
-bin/linux-x86_64/langid     built helper binary (build artefact)
+bin/linux-x86_64/langid     built helper binary (committed for releases)
+.forgejo/                   Forgejo release workflow and packaging hooks
 ```
 
 The plugin files live in the repository root, matching the usual LMS plugin
@@ -182,15 +183,18 @@ $ printf '这是一个语言检测测试。' | ./bin/linux-x86_64/langid --top 2
 
 1. Build the helper for the LMS platform (`./scripts/build.sh` for Linux
    x86_64) and make sure `bin/<platform>/langid` is present.
-2. Copy the plugin directory (this repository, including `install.xml`,
-   `Plugin.pm`, `API.pm`, `bin/`, `strings.txt` and `VERSION`) to the LMS
-   plugins directory, for example `Plugins/LangID` below the LMS server root,
-   or `Cache/InstalledPlugins/Plugins/LangID` for a managed installation.
+2. Use the release archive (or render `install.xml` from `@VERSION@` when
+   installing from a development checkout) and copy the plugin directory
+   (containing `install.xml`, `Plugin.pm`, `API.pm`, `bin/`, `strings.txt` and
+   `VERSION`) to the LMS plugins directory, for example `Plugins/LangID` below
+   the LMS server root, or `Cache/InstalledPlugins/Plugins/LangID` for a
+   managed installation.
 3. Restart LMS and enable **LangID** under *Settings → Plugins*.
 4. No settings page is provided; the plugin has no user-facing UI.
 
 `install.xml` declares the extension name `PLUGIN_LANGID`, the module
-`Plugins::LangID::Plugin`, minimum LMS version 8.0 and plugin version 0.1.0.
+`Plugins::LangID::Plugin`, minimum LMS version 8.0 and the version rendered
+from the `VERSION` file (`@VERSION@`) by the release pipeline.
 
 ### Platform matrix
 
@@ -310,6 +314,37 @@ Current results:
   | English | `en` | English | 1.00 |
 
   plus `--languages`, `--version`, empty input and exit-code checks.
+
+## Releasing
+
+The Forgejo release pipeline lives in `.forgejo/`:
+
+- `.forgejo/workflows/release.yml` runs on tags matching `v1.2.3` / `1.2.3`
+  and delegates to the shared `BeyondandSharp/action-template` workflow.
+- `.forgejo/workflows/release-manual.yml` allows a manual dispatch (with an
+  optional dry run) for an existing tag.
+- `.forgejo/release/preflight.sh` checks that `VERSION`, `Cargo.toml`,
+  `install.xml` (`@VERSION@` placeholder), the committed helper binary and
+  `HEAD` all agree with the requested version.
+- `.forgejo/release/prepare.sh` packages the tagged tree (via `git archive`)
+  into `dist/LangID-<version>.zip` and `.tar.gz`, renders `install.xml` from
+  `VERSION`, keeps `VERSION` for `API->version`, and leaves the helper binary
+  executable inside the archive.
+
+The version has a single source of truth: the `VERSION` file. Before tagging,
+update `VERSION` and `Cargo.toml`, rebuild and commit
+`bin/linux-x86_64/langid`, commit the release notes, then push a tag:
+
+```sh
+./scripts/build.sh
+git add -A
+git commit -m "release 0.2.0"
+git tag v0.2.0
+git push origin main --tags
+```
+
+Commit the `.forgejo/` files first; the workflows only run once they are in the
+repository. The released archive is installed as `Plugins/LangID` in LMS.
 
 ## License and attribution
 

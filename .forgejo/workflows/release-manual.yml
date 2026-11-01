@@ -1,0 +1,35 @@
+# Frozen entry — manual dispatch.
+#
+# The orchestration lives in the template repository as a reusable workflow.
+# THIS FILE IS COPIED ONCE AND NEVER EDITED. A separate file is needed (instead
+# of one file with `if:`) because Forgejo expands reusable workflows under the
+# callee's trigger (`workflow_call`); a caller-side `if:` on `github.event_name`
+# would make the expanded jobs inherit a false condition and the run would be
+# reported as ignored.
+name: release (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '要发布的版本，例如 1.2.3；必须对应一个已存在的 tag（1.2.3 与 v1.2.3 都接受）'
+        required: false
+        type: string
+      dry_run:
+        description: '只演练：跑前置检查与打包，不创建 Release、不上传资产'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    uses: BeyondandSharp/action-template/.forgejo/workflows/release.yml@main
+    secrets: inherit
+    with:
+      mode: manual
+      version: ${{ inputs.version }}
+      dry_run: ${{ inputs.dry_run }}
