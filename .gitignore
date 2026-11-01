@@ -8,3 +8,7 @@
 *.swp
 *~
 .DS_Store
+
+# Downloaded fastText model (fetch on demand; never commit)
+/models/lid.176.ftz
+/models/*.part-*

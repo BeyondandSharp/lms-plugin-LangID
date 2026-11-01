@@ -5,18 +5,25 @@
 
 - a static Rust command-line helper, `langid`, built on
   [lingua-rs](https://github.com/pemistahl/lingua-rs) with only the selected
-  language models compiled in;
-- a minimal Perl wrapper that exposes the helper to LMS and to other plugins.
+  language models compiled in; the optional fastText `lid.176.ftz` model is
+  downloaded on demand for the second-opinion `suite` comparison;
+- a minimal Perl wrapper that exposes both detectors to LMS and to other
+  plugins.
 
-Everything runs locally: no network access, no Python, no external services.
-The helper is a static musl binary, so it also works on old glibc systems such
-as the Debian 12 "bookworm" based LMS containers (glibc 2.36).
+Everything runs locally: no Python, no external services, no telemetry. The
+only network operation is the one-time download of the fastText model when
+`suite` is used for the first time; LMS caches it locally afterwards. Without
+the model everything except the fastText half of the suite keeps working. The
+helper is a static musl binary, so it also works on old glibc systems such as
+the Debian 12 "bookworm" based LMS containers (glibc 2.36).
 
 ## Repository layout
 
 ```text
 Cargo.toml / Cargo.lock     Rust crate `langid`
-src/main.rs                 helper CLI (stdin -> JSON)
+src/main.rs                 helper CLI (stdin -> JSON, suite mode)
+models/README.md, LICENSE   fastText model URL, checksum and license
+                            (the model itself is downloaded, not shipped)
 scripts/build.sh            build the static binary into bin/<platform>/
 scripts/smoke.sh            end-to-end checks for the compiled binary
 API.pm                      Plugins::LangID::API - async wrapper for LMS
@@ -26,6 +33,7 @@ VERSION                     plugin version (single source of truth)
 strings.txt                 plugin strings
 t/api.t                     unit tests for the Perl wrapper
 t/fixtures/fake-langid      stand-in binary used by the unit tests
+t/fixtures/fake-langid-suite stand-in binary for the detect_suite() tests
 t/lib/                      minimal AnyEvent shim for the unit tests
 bin/linux-x86_64/langid     built helper binary (committed for releases)
 .forgejo/                   Forgejo release workflow and packaging hooks
@@ -41,8 +49,10 @@ repository convention: the archive root is installed as `Plugins/LangID/`, so
 - `x86_64-unknown-linux-musl` target plus `musl-gcc` for the static build;
 - Lyrion Music Server 8.0 or newer and Perl 5.10 or newer to run the plugin;
 - the Perl wrapper uses only modules shipped with LMS or Perl core
-  (`AnyEvent`, `IPC::Open3`, `JSON::PP`, `Encode`). The tests need no CPAN
-  modules at all.
+  (`AnyEvent`, `IPC::Open3`, `JSON::PP`, `Encode`, `Digest::SHA`). The tests
+  need no CPAN modules at all;
+- network access (or a pre-seeded model via `LANGID_MODEL_PATH` /
+  `LANGID_MODEL_DIR`) on the first `suite` use; nothing else downloads.
 
 ## Building the helper
 
@@ -61,11 +71,13 @@ Measured on the build host (Debian 13, Rust 1.99):
 
 | Build | Options | Size |
 | --- | --- | --- |
-| default | `lang-zh`, `lang-en`, `lang-ja`, `lang-ko` | **6,834,432 bytes (6.52 MiB)** |
-| extended | default + 12 more languages | 64,379,136 bytes (61.4 MiB) |
+| default | `lang-zh`, `lang-en`, `lang-ja`, `lang-ko` | **6,891,776 bytes (6.57 MiB)** |
+| extended | default + 12 more languages | 64,436,480 bytes (61.44 MiB) |
 
 Both are `ELF 64-bit LSB pie executable, static-pie linked, stripped` with no
-dynamic dependencies.
+dynamic dependencies. The fastText model (938,013 bytes) is **not embedded**:
+the helper accepts it with `--model`, and the Perl wrapper downloads it on
+first use and caches it.
 
 ### Language feature selection
 
@@ -92,7 +104,7 @@ model crate, so only the requested models end up in the binary.
 | `lang-vi` | Vietnamese | `vi` | – | yes |
 
 The default set is intentionally small. Every compiled model adds several
-MiB to the binary (the extended build is about 61 MiB); pick the smallest set
+MiB to the binary (the extended build is about 62 MiB); pick the smallest set
 that covers your library.
 
 ```bash
@@ -179,6 +191,57 @@ $ printf '这是一个语言检测测试。' | ./bin/linux-x86_64/langid --top 2
 {"language":"Chinese","iso":"zh","confidence":1,"scores":[{"language":"Chinese","confidence":1},{"language":"English","confidence":0}]}
 ```
 
+### Suite command: lingua + fastText cross-check
+
+The fastText model is not bundled with the binary. For CLI use download it
+once (the LMS wrapper does this automatically) and pass it with `--model`:
+
+```console
+$ curl -fsSL -o /tmp/lid.176.ftz \
+    https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz
+$ printf '这是一个语言检测测试。' | ./bin/linux-x86_64/langid suite --target zh-Hans --model /tmp/lid.176.ftz
+{"target":"zh-Hans","lingua":{"confidence":1,"language":"zh","name":"Chinese"},"fastlang":{"confidence":1,"language":"zh","name":"Chinese"}}
+```
+
+Without a usable model the lingua part is still returned and fastlang is null:
+
+```console
+$ printf '这是一个语言检测测试。' | ./bin/linux-x86_64/langid suite --target zh-Hans
+{"target":"zh-Hans","lingua":{"confidence":1,"language":"zh","name":"Chinese"},"fastlang":null}
+```
+
+`suite` reads and sanitises stdin exactly like the default mode and prints one
+JSON object:
+
+- `target` echoes the requested target;
+- `lingua` is the compiled lingua-rs confidence for the target language;
+- `fastlang` is computed from the model given via `--model` (or the
+  `LANGID_MODEL_PATH` environment variable): `predict(text, k=8, 0.0)`, then
+  the maximum probability among the labels of the target family. fastText
+  probabilities are clamped to `0.0` – `1.0`;
+- both blocks contain `confidence`, `language` (lowercase ISO 639-1) and
+  `name` (display name). A missing, unreadable or invalid model only makes
+  `fastlang` null; it never fails the lingua result or the exit code.
+
+The download URL, expected size (938,013 bytes), SHA-256 and license are
+documented in [`models/README.md`](models/README.md).
+
+Target mapping:
+
+| `--target` | lingua language | fastText label family |
+| --- | --- | --- |
+| `zh`, `zh-Hans`, `zh-Hant`, `cmn` | Chinese (`zh`) | `zh`, `zh-cn`, `zh-tw`, `zh-hans`, `zh-hant`, `cmn`, `yue`, `wuu` |
+| `en` | English (`en`) | `en` |
+| `ja` | Japanese (`ja`) | `ja` |
+| `ko` | Korean (`ko`) | `ko` |
+
+The lookup is case-insensitive. An unsupported target prints
+`{"error":"unsupported target: ..."}`, a missing `--target` prints a JSON
+error, and both exit with status 2. Empty input yields confidence 0 for both
+detectors while still echoing the target. `--languages` is unaffected: it
+lists the compiled lingua models, while the fastText model always knows 176
+languages.
+
 ## Installing the LMS plugin
 
 1. Build the helper for the LMS platform (`./scripts/build.sh` for Linux
@@ -234,12 +297,27 @@ if ( Plugins::LangID::API->available ) {
         my $scores     = $result->{scores};     # [ { language, name, confidence }, ... ]
     } );
 }
+
+# Two-detector comparison, e.g. for the lyrics translation detector.
+Plugins::LangID::API->detect_suite( $text, 'zh-Hans', sub {
+    my $result = shift;
+
+    if ( $result->{error} ) {
+        return;   # missing helper, unsupported target, timeout, ...
+    }
+
+    my $target        = $result->{target};           # e.g. "zh-Hans"
+    my $iso           = $result->{lingua}{language}; # e.g. "zh"
+    my $lingua_conf   = $result->{lingua}{confidence};
+    my $fastlang_conf = $result->{fastlang}{confidence};
+} );
 ```
 
 | Method | Description |
 | --- | --- |
 | `available()` | true when the helper binary exists and is executable |
 | `detect($text, $callback)` | asynchronous detection; invokes `$callback` exactly once |
+| `detect_suite($text, $target, $callback)` | asynchronous lingua + fastText comparison for `zh`/`en`/`ja`/`ko` targets |
 | `languages()` | arrayref of ISO 639-1 codes compiled into the binary (cached) |
 | `binary_path()` | absolute path of the helper, including the platform mapping |
 | `version()` | plugin version from the `VERSION` file |
@@ -260,6 +338,31 @@ The wrapper normalises the helper's output for consumers:
   confidence: <float> }`;
 - for empty text the result is `{ language => undef, name => undef,
   iso => undef, confidence => 0, scores => [] }`.
+
+`detect_suite($text, $target, $callback)` first ensures that the fastText
+model exists, then runs the helper as
+`langid suite --target $target --model $path` with the same asynchronous
+process handling and timeout. Model handling:
+
+- `LANGID_MODEL_PATH` (or `model_path_override()` in tests) selects an exact
+  model file; it is used as-is;
+- otherwise the model is cached at `<LMS prefs dir>/langid/lid.176.ftz`;
+  `LANGID_MODEL_DIR` overrides the directory and `LANGID_MODEL_URL` the
+  download URL;
+- on first use the wrapper downloads asynchronously with
+  `Slim::Networking::SimpleAsyncHTTP` (30 second timeout) into a temporary
+  file, verifies size 938,013 and SHA-256
+  `8f3472cf…603e83`, sets mode `0644` and atomically renames it into place;
+  concurrent `detect_suite()` calls share a single download;
+- if the model cannot be obtained, a warning is logged and the helper is
+  called **without** `--model`: the callback still receives the lingua result
+  with `fastlang => undef`, so translation detection keeps working.
+
+The callback receives
+`{ target, lingua => { confidence, language, name },
+fastlang => { confidence, language, name } | undef }` or `{ error => ... }`.
+The binary's JSON errors (for example an unsupported target) are surfaced as
+the `error` value. `detect()` itself is unchanged.
 
 On failure the callback receives `{ error => "<message>" }` instead. Calling
 `detect()` on a missing binary returns such an error synchronously.
@@ -300,11 +403,17 @@ prove -l t            # or: perl t/api.t
 
 Current results:
 
-- `cargo test`: 18 tests passed;
-- `perl t/api.t`: 40 tests passed (normal, empty input, timeout, crash,
-  malformed JSON, missing binary, `--languages`, sanitisation, platform
-  mapping);
-- `scripts/smoke.sh`: 8 checks passed:
+- `cargo test`: 30 tests passed (sanitisation, JSON, ISO mapping, argument
+  parsing, suite target mapping, `--model` parsing, fastText score extraction
+  and clamping, fastlang-null rendering, missing model file, detector
+  samples);
+- `perl t/api.t`: 93 tests passed (normal, empty input, timeout, crash,
+  malformed JSON, missing binary, `--languages`, `detect_suite()` with a
+  present model -> `--model`, download-on-first-use with cache/mode/SHA
+  checks, failed download -> lingua-only without `--model`, concurrent
+  downloads coalesced, missing fastlang -> undef, binary errors and missing
+  target, sanitisation, platform mapping);
+- `scripts/smoke.sh`: 17 checks with a verified model (12 without), including:
 
   | Sample | Expected | Language | Confidence |
   | --- | --- | --- | --- |
@@ -313,7 +422,12 @@ Current results:
   | Korean | `ko` | Korean | 1.00 |
   | English | `en` | English | 1.00 |
 
-  plus `--languages`, `--version`, empty input and exit-code checks.
+  plus suite checks (`zh-Hans`, `zh-Hant`, `en`, `ja`, `ko`, both detectors
+  >= 0.5 when a verified model is available), a no-model fastlang=null check,
+  an invalid `--model` check, `--languages`, `--version`, empty input and
+  exit-code checks. The script downloads the model with `curl` into a temporary
+  directory (or reuses `LANGID_MODEL_PATH`), verifies size and SHA-256, and
+  skips the fastlang assertions cleanly when no model can be obtained.
 
 ## Releasing
 
@@ -357,5 +471,23 @@ It embeds and links:
   Copyright © Peter M. Stahl;
 - the lingua language model crates (Apache-2.0), which contain the trained
   model data compiled into the helper binary;
+- the optional fastText language-identification model `lid.176.ftz`
+  (938,013 bytes), Copyright © Facebook, Inc. and the fastText contributors,
+  licensed under
+  [Creative Commons Attribution-ShareAlike 3.0 Unported](models/LICENSE).
+  The model is **not** shipped in this repository or embedded in the helper
+  binary; it is downloaded by the LMS wrapper on first use. The downloaded
+  model file remains under CC BY-SA 3.0: keep the attribution and comply with
+  the ShareAlike terms if you redistribute that file; see
+  [`models/README.md`](models/README.md);
+- [fasttext-pure-rs](https://github.com/silvermine/fasttext-pure-rs) 0.1.0,
+  MIT, Copyright © 2026 Jeremy Thomerson;
 - the transitive Rust dependencies listed in `Cargo.lock` (MIT/Apache-2.0
   compatible licenses).
+
+**Model-license caveat:** LangID source code and the compiled helper
+(including release archives) are Apache-2.0 only — they contain no model data.
+The fastText model is downloaded at run time and remains CC BY-SA 3.0. A
+distribution that bundles the downloaded model file itself is a combined
+distribution and must keep `NOTICE`, `models/LICENSE` and `models/README.md`
+for the model. Keep those files with any redistribution of the model.

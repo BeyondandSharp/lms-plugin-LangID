@@ -16,7 +16,9 @@ use lib "$Bin/lib";
 
 use Config ();
 use Encode ();
+use File::Path ();
 use File::Spec::Functions qw(catfile);
+use File::Temp ();
 use Test::More;
 use Time::HiRes ();
 
@@ -26,10 +28,62 @@ require "$Bin/../API.pm";
 
 my $API  = 'Plugins::LangID::API';
 my $FAKE = "$Bin/fixtures/fake-langid";
+my $FAKE_SUITE = "$Bin/fixtures/fake-langid-suite";
 
 chmod 0755, $FAKE unless -x $FAKE;
 
 ok( -x $FAKE, 'fake langid helper is executable' );
+
+chmod 0755, $FAKE_SUITE unless -x $FAKE_SUITE;
+
+ok( -x $FAKE_SUITE, 'fake suite helper is executable' );
+
+# ---------------------------------------------------------------------------
+# Model-download test setup (fully offline)
+# ---------------------------------------------------------------------------
+
+my $MODEL_DIR = File::Temp::tempdir( CLEANUP => 1 );
+
+$ENV{LANGID_MODEL_DIR} = $MODEL_DIR;
+delete $ENV{LANGID_MODEL_PATH};
+delete $ENV{LANGID_MODEL_URL};
+
+# Accept any non-empty file as a model in the wrapper tests. The real
+# size/SHA-256 verification is covered by the dedicated test block below and
+# end-to-end by scripts/smoke.sh against the actual download.
+$API->set_model_verifier( sub { my ($path) = @_; return ( -f $path && ( -s $path ) > 0 ) ? 1 : 0; } );
+
+sub model_cache_file { return catfile( $MODEL_DIR, 'lid.176.ftz' ); }
+
+sub reset_model_cache {
+	my $file = model_cache_file();
+	unlink $file if -e $file;
+	return;
+}
+
+sub write_fake_model {
+	my ($path) = @_;
+
+	open my $handle, '>:raw', $path or die "cannot write $path: $!";
+	print {$handle} 'fake lid.176.ftz for unit tests';
+	close $handle;
+	chmod 0644, $path;
+
+	return $path;
+}
+
+sub read_args_file {
+	my ($path) = @_;
+
+	open my $handle, '<', $path or return '';
+
+	local $/;
+	my $content = <$handle> // '';
+
+	close $handle;
+
+	return $content;
+}
 
 # ---------------------------------------------------------------------------
 # Module basics: version, plugin directory and platform mapping
@@ -260,6 +314,339 @@ if ( defined $platform ) {
 
 	ok( ref $result eq 'HASH' && defined $result->{error}, 'detect() reports a missing binary' );
 	like( $result->{error} // '', qr/not available/i, 'missing binary error is descriptive' );
+}
+
+# ---------------------------------------------------------------------------
+# detect_suite(): model handling and detector results
+# ---------------------------------------------------------------------------
+
+# A model file that already exists is passed to the helper as --model.
+{
+	my $model = write_fake_model( catfile( $MODEL_DIR, 'explicit-model.ftz' ) );
+
+	local $ENV{LANGID_BIN}            = $FAKE_SUITE;
+	local $ENV{LANGID_MODEL_PATH}     = $model;
+	local $ENV{FAKE_SUITE_MODE}       = 'normal';
+	local $ENV{FAKE_SUITE_ARGS_FILE}  = catfile( $MODEL_DIR, 'args-present.txt' );
+
+	unlink $ENV{FAKE_SUITE_ARGS_FILE};
+
+	ok( $API->model_available, 'model_available() accepts the test model' );
+
+	my $called = 0;
+	my $result;
+
+	$API->detect_suite( '这是一个测试。', 'zh-Hans', sub { $called++; $result = shift } );
+
+	AnyEvent::pump( max_seconds => 10 );
+
+	is( $called, 1, 'detect_suite() invokes the callback exactly once' );
+	is( ref $result, 'HASH', 'detect_suite() passes a hash reference' );
+	is( $result->{target}, 'zh-Hans', 'detect_suite() echoes the target' );
+	is( ref $result->{lingua}, 'HASH', 'detect_suite() returns the lingua block' );
+	is( ref $result->{fastlang}, 'HASH', 'detect_suite() returns the fastlang block' );
+	is( $result->{lingua}{language}, 'zh', 'lingua language is the ISO code' );
+	is( $result->{lingua}{name}, 'Chinese', 'lingua name is the display name' );
+	cmp_ok( $result->{lingua}{confidence}, '==', 0.99, 'lingua confidence is passed through' );
+	is( $result->{fastlang}{language}, 'zh', 'fastlang language is the ISO code' );
+	is( $result->{fastlang}{name}, 'Chinese', 'fastlang name is the display name' );
+	cmp_ok( $result->{fastlang}{confidence}, '==', 0.97, 'fastlang confidence is passed through' );
+
+	like(
+		read_args_file( $ENV{FAKE_SUITE_ARGS_FILE} ),
+		qr/suite --target zh-Hans --model \Q$model\E/,
+		'helper is called with --target and --model',
+	);
+}
+
+# The target is forwarded; the model is reused.
+{
+	my $model = write_fake_model( catfile( $MODEL_DIR, 'explicit-model.ftz' ) );
+	local $ENV{LANGID_BIN}        = $FAKE_SUITE;
+	local $ENV{LANGID_MODEL_PATH} = $model;
+	local $ENV{FAKE_SUITE_MODE}   = 'normal';
+
+	my $result;
+
+	$API->detect_suite( 'This is a test.', 'en', sub { $result = shift } );
+
+	AnyEvent::pump( max_seconds => 10 );
+
+	is( $result->{target}, 'en', 'detect_suite() forwards the English target' );
+	is( $result->{lingua}{language}, 'en', 'detect_suite() returns English for the en target' );
+	is( $result->{fastlang}{language}, 'en', 'detect_suite() returns English fastlang for en' );
+}
+
+# Empty input: confidence 0 in both detectors when the model is available.
+{
+	my $model = write_fake_model( catfile( $MODEL_DIR, 'explicit-model.ftz' ) );
+	local $ENV{LANGID_BIN}        = $FAKE_SUITE;
+	local $ENV{LANGID_MODEL_PATH} = $model;
+	local $ENV{FAKE_SUITE_MODE}   = 'empty';
+
+	my $result;
+
+	$API->detect_suite( '   ', 'ja', sub { $result = shift } );
+
+	AnyEvent::pump( max_seconds => 10 );
+
+	is( $result->{target}, 'ja', 'detect_suite() keeps the target for empty input' );
+	is( $result->{lingua}{confidence}, 0, 'empty input yields lingua confidence 0' );
+	is( $result->{fastlang}{confidence}, 0, 'empty input yields fastlang confidence 0' );
+}
+
+# Missing model -> downloaded once -> verified -> passed to the helper.
+{
+	reset_model_cache();
+
+	my $cache       = model_cache_file();
+	my $fetch_count = 0;
+	my $url_seen;
+
+	local $ENV{LANGID_BIN}           = $FAKE_SUITE;
+	local $ENV{FAKE_SUITE_MODE}      = 'normal';
+	local $ENV{FAKE_SUITE_ARGS_FILE} = catfile( $MODEL_DIR, 'args-download.txt' );
+
+	unlink $ENV{FAKE_SUITE_ARGS_FILE};
+
+	$API->set_model_fetcher(
+		sub {
+			my ( $url, $temp, $done ) = @_;
+
+			$fetch_count++;
+			$url_seen = $url;
+
+			open my $handle, '>:raw', $temp or die "cannot write $temp: $!";
+			print {$handle} 'downloaded fake lid.176.ftz';
+			close $handle;
+
+			$done->( 1, undef );
+
+			return;
+		}
+	);
+
+	my $result;
+
+	$API->detect_suite( '这是一个测试。', 'zh', sub { $result = shift } );
+
+	AnyEvent::pump( max_seconds => 20 );
+
+	$API->set_model_fetcher(undef);
+
+	is( $fetch_count, 1, 'missing model is downloaded exactly once' );
+	is( $url_seen, $API->model_url, 'downloader receives the configured model URL' );
+	ok( -f $cache, 'downloaded model is stored in the cache' );
+	is( ( stat $cache )[2] & 07777, 0644, 'cached model has mode 0644' );
+	is( ref $result, 'HASH', 'suite result is a hash reference' );
+	is( $result->{lingua}{language}, 'zh', 'lingua result is present after download' );
+	ok( defined $result->{fastlang}, 'fastlang result is present after download' );
+	like(
+		read_args_file( $ENV{FAKE_SUITE_ARGS_FILE} ),
+		qr/--model \Q$cache\E/,
+		'helper is called with the downloaded model path',
+	);
+}
+
+# Download failure -> suite still runs, without --model and with fastlang null.
+{
+	reset_model_cache();
+
+	my $cache = model_cache_file();
+
+	local $ENV{LANGID_BIN}           = $FAKE_SUITE;
+	local $ENV{FAKE_SUITE_MODE}      = 'normal';
+	local $ENV{FAKE_SUITE_ARGS_FILE} = catfile( $MODEL_DIR, 'args-failure.txt' );
+
+	unlink $ENV{FAKE_SUITE_ARGS_FILE};
+
+	$API->set_model_fetcher(
+		sub {
+			my ( $url, $temp, $done ) = @_;
+
+			$done->( 0, 'simulated network failure' );
+
+			return;
+		}
+	);
+
+	my $result;
+	my @warnings;
+
+	local $SIG{__WARN__} = sub { push @warnings, @_ };
+
+	$API->detect_suite( '这是一个测试。', 'zh', sub { $result = shift } );
+
+	AnyEvent::pump( max_seconds => 20 );
+
+	$API->set_model_fetcher(undef);
+
+	ok(
+		( grep { m{download failed}i } @warnings ),
+		'failed download is logged as a warning',
+	);
+	is( ref $result, 'HASH', 'failed download still yields a suite result' );
+	is( $result->{lingua}{language}, 'zh', 'lingua result survives a failed download' );
+	ok( !defined $result->{fastlang}, 'fastlang is null after a failed download' );
+	ok( !-e $cache, 'no model file is left behind after a failed download' );
+
+	my $args = read_args_file( $ENV{FAKE_SUITE_ARGS_FILE} );
+	like( $args, qr/suite --target zh/, 'suite is called without a model after a failed download', );
+	unlike( $args, qr/--model/, 'no --model flag is passed after a failed download' );
+}
+
+# Concurrent requests share a single download.
+{
+	reset_model_cache();
+
+	my $fetch_count = 0;
+	my $pending;
+	my $timer_guard;
+
+	local $ENV{LANGID_BIN}           = $FAKE_SUITE;
+	local $ENV{FAKE_SUITE_MODE}      = 'normal';
+	local $ENV{FAKE_SUITE_ARGS_FILE} = catfile( $MODEL_DIR, 'args-concurrent.txt' );
+
+	unlink $ENV{FAKE_SUITE_ARGS_FILE};
+
+	$API->set_model_fetcher(
+		sub {
+			my ( $url, $temp, $done ) = @_;
+
+			$fetch_count++;
+
+			$pending = sub {
+				open my $handle, '>:raw', $temp or die "cannot write $temp: $!";
+				print {$handle} 'concurrent fake model';
+				close $handle;
+				$done->( 1, undef );
+				return;
+			};
+
+			# The guard must stay referenced, otherwise the timer is canceled
+			# before it can fire.
+			$timer_guard = AnyEvent->timer(
+				after => 0.05,
+				cb    => sub {
+					$timer_guard = undef;
+					my $finish = $pending;
+					$pending = undef;
+					$finish->() if $finish;
+					return;
+				},
+			);
+
+			return;
+		}
+	);
+
+	my @results;
+	my $calls = 0;
+
+	$API->detect_suite( 'first', 'zh', sub { $calls++; push @results, shift } );
+	$API->detect_suite( 'second', 'zh', sub { $calls++; push @results, shift } );
+
+	AnyEvent::pump( max_seconds => 20 );
+
+	$API->set_model_fetcher(undef);
+
+	is( $fetch_count, 1, 'concurrent detect_suite() calls coalesce into one download' );
+	is( $calls, 2, 'both concurrent callbacks are invoked' );
+	is( scalar @results, 2, 'both concurrent results are returned' );
+	ok( defined $results[0]{fastlang}, 'first concurrent result has fastlang' );
+	ok( defined $results[1]{fastlang}, 'second concurrent result has fastlang' );
+}
+
+# Missing fastlang field is tolerated (model unavailable) instead of an error.
+{
+	my $model = write_fake_model( catfile( $MODEL_DIR, 'explicit-model.ftz' ) );
+
+	local $ENV{LANGID_BIN}        = $FAKE_SUITE;
+	local $ENV{LANGID_MODEL_PATH} = $model;
+	local $ENV{FAKE_SUITE_MODE}   = 'nofastlang';
+
+	my $result;
+
+	$API->detect_suite( '这是一个测试。', 'zh', sub { $result = shift } );
+
+	AnyEvent::pump( max_seconds => 10 );
+
+	is( ref $result, 'HASH', 'missing fastlang field yields a result hash' );
+	ok( !defined $result->{fastlang}, 'missing fastlang field becomes undef' );
+	is( $result->{lingua}{language}, 'zh', 'lingua result is still present' );
+}
+
+# Default (real) verifier rejects a wrong-size file; the test hook restores it.
+{
+	$API->set_model_verifier(undef);
+
+	my $bad = catfile( $MODEL_DIR, 'bad-model.ftz' );
+
+	open my $handle, '>:raw', $bad or die "cannot write $bad: $!";
+	print {$handle} 'not the real model';
+	close $handle;
+
+	local $ENV{LANGID_MODEL_PATH} = $bad;
+
+	ok( !$API->model_available, 'default verifier rejects a wrong-size model file' );
+
+	$API->set_model_verifier( sub { my ($path) = @_; return ( -f $path && ( -s $path ) > 0 ) ? 1 : 0; } );
+}
+
+# Binary errors are still surfaced when a usable model is present.
+{
+	my $model = write_fake_model( catfile( $MODEL_DIR, 'explicit-model.ftz' ) );
+
+	local $ENV{LANGID_BIN}        = $FAKE_SUITE;
+	local $ENV{LANGID_MODEL_PATH} = $model;
+	local $ENV{FAKE_SUITE_MODE}   = 'error';
+
+	my $result;
+
+	$API->detect_suite( 'texte', 'fr', sub { $result = shift } );
+
+	AnyEvent::pump( max_seconds => 10 );
+
+	ok( ref $result eq 'HASH' && defined $result->{error}, 'detect_suite() reports a binary error' );
+	like( $result->{error} // '', qr/unsupported target: fr/, 'binary JSON error is surfaced to the caller' );
+}
+
+{
+	my $model = write_fake_model( catfile( $MODEL_DIR, 'explicit-model.ftz' ) );
+
+	local $ENV{LANGID_BIN}        = $FAKE_SUITE;
+	local $ENV{LANGID_MODEL_PATH} = $model;
+	local $ENV{FAKE_SUITE_MODE}   = 'crash';
+
+	my $result;
+
+	$API->detect_suite( 'crash', 'zh', sub { $result = shift } );
+
+	AnyEvent::pump( max_seconds => 10 );
+
+	ok( ref $result eq 'HASH' && defined $result->{error}, 'detect_suite() reports a crashing helper' );
+	like( $result->{error} // '', qr/status 3/, 'suite crash error contains the exit status' );
+}
+
+{
+	my $result;
+
+	# Missing target fails synchronously, before spawning a process.
+	$API->detect_suite( 'text', undef, sub { $result = shift } );
+
+	ok( ref $result eq 'HASH' && defined $result->{error}, 'detect_suite() requires a target' );
+	like( $result->{error} // '', qr/target/i, 'missing target error is descriptive' );
+}
+
+{
+	local $ENV{LANGID_BIN} = '/nonexistent/langid';
+
+	my $result;
+
+	$API->detect_suite( 'text', 'zh', sub { $result = shift } );
+
+	ok( ref $result eq 'HASH' && defined $result->{error}, 'detect_suite() reports a missing binary' );
+	like( $result->{error} // '', qr/not available/i, 'suite missing binary error is descriptive' );
 }
 
 done_testing();

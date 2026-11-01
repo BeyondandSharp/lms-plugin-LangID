@@ -7,11 +7,28 @@ package Plugins::LangID::API;
 # IPC::Open3 and returns the parsed result to the caller.
 #
 # Public API:
-#   Plugins::LangID::API->available            -> true if the helper is usable
-#   Plugins::LangID::API->detect($text, $cb)   -> asynchronous; $cb->(\%result)
-#   Plugins::LangID::API->languages            -> arrayref of ISO 639-1 codes
-#   Plugins::LangID::API->binary_path          -> absolute path of the helper
-#   Plugins::LangID::API->version              -> plugin version string
+#   Plugins::LangID::API->available                       -> true if the helper is usable
+#   Plugins::LangID::API->detect($text, $cb)              -> asynchronous; $cb->(\%result)
+#   Plugins::LangID::API->detect_suite($text, $target, $cb) -> lingua + fastText result
+#   Plugins::LangID::API->languages                       -> arrayref of ISO 639-1 codes
+#   Plugins::LangID::API->binary_path                     -> absolute path of the helper
+#   Plugins::LangID::API->version                         -> plugin version string
+#
+# The fastText model (lid.176.ftz) is not shipped with the plugin. The first
+# detect_suite() call downloads it to a persistent cache, verifies size and
+# SHA-256, and then passes it to the helper with --model. If the download
+# fails, the suite still returns the lingua result and fastlang => undef.
+#
+# Model configuration (environment):
+#   LANGID_MODEL_PATH  exact model file to use (as-is)
+#   LANGID_MODEL_DIR   cache directory (default: <LMS prefs>/langid)
+#   LANGID_MODEL_URL   download URL (default: official fastText lid.176.ftz)
+#
+# Test hooks (t/api.t, never needed in production):
+#   set_model_fetcher($coderef)   sub ($url, $temp_path, $done) - replaces the
+#                                 SimpleAsyncHTTP download; $done->($ok, $err)
+#   set_model_verifier($coderef)  sub ($path) -> bool - replaces size/SHA checks
+#   model_path_override($path)    use exactly $path, bypassing cache dir logic
 #
 # The module deliberately has no compile-time LMS dependencies so that the
 # unit tests can exercise it on a plain Perl installation (see t/api.t).
@@ -22,15 +39,17 @@ use warnings;
 use AnyEvent ();
 use AnyEvent::Util qw(fh_nonblocking);
 use Config ();
+use Digest::SHA ();
 use Encode ();
 use File::Basename ();
-use File::Spec::Functions qw(catfile rel2abs);
+use File::Path ();
+use File::Spec::Functions qw(catfile rel2abs tmpdir);
 use IPC::Open3 ();
 use JSON::PP ();
 use Symbol qw(gensym);
 use Time::HiRes ();
 
-our $VERSION = '0.1.0';
+our $VERSION = '0.1.1';
 
 use constant {
 	MAX_CHARS      => 16_000,
@@ -69,6 +88,22 @@ my %ISO_BY_NAME = (
 # languages() is a cheap query, but it still spawns a process. Cache the answer
 # per binary path so repeated calls (UI, CLI, other plugins) do not respawn it.
 my %LANGUAGES_CACHE;
+
+# ---------------------------------------------------------------------------
+# fastText model download and cache
+# ---------------------------------------------------------------------------
+
+our $MODEL_URL_DEFAULT = 'https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz';
+our $MODEL_SIZE        = 938_013;
+our $MODEL_SHA256      = '8f3472cfe8738a7b6099e8e999c3cbfae0dcd15696aac7d7738a8039db603e83';
+our $MODEL_FILENAME    = 'lid.176.ftz';
+our $MODEL_FETCH_TIMEOUT = 30;
+
+my $MODEL_PATH_OVERRIDE;
+my $MODEL_FETCHER;
+my $MODEL_VERIFIER;
+my $MODEL_LOG;
+my %MODEL_DOWNLOADS;
 
 # Directory this module was loaded from. The plugin layout keeps API.pm,
 # Plugin.pm and the bin/ directory side by side.
@@ -326,12 +361,425 @@ sub languages {
 #     confidence => <float>, scores => [ { language, name, confidence }, ... ] }
 # on success, or { error => <message> } on failure.
 #
-# The helper is executed directly (no shell). Its stdin is closed after the
-# normalised text has been written. Stdout is parsed as JSON. If the helper
-# does not finish within TIMEOUT seconds it receives SIGTERM and, after
-# KILL_GRACE more seconds, SIGKILL; the callback then receives a timeout error.
+# This method is unchanged from the first version of the plugin; it runs the
+# helper binary in its default stdin -> JSON mode.
 sub detect {
 	my ( $class, $text, $callback ) = @_;
+
+	return $class->_detect_with_arguments( $text, [], \&_parse_detect, $callback );
+}
+
+# ---------------------------------------------------------------------------
+# fastText model access
+# ---------------------------------------------------------------------------
+
+# Download URL, overridable for mirrors or tests.
+sub model_url {
+	my ($class) = @_;
+
+	return $ENV{LANGID_MODEL_URL}
+		if defined $ENV{LANGID_MODEL_URL} && length $ENV{LANGID_MODEL_URL};
+
+	return $MODEL_URL_DEFAULT;
+}
+
+# Persistent cache directory for the downloaded model.
+sub model_cache_dir {
+	my ($class) = @_;
+
+	return $ENV{LANGID_MODEL_DIR}
+		if defined $ENV{LANGID_MODEL_DIR} && length $ENV{LANGID_MODEL_DIR};
+
+	my $base;
+	if ( eval { require Slim::Utils::Prefs; 1 } ) {
+		$base = eval { Slim::Utils::Prefs::dir() };
+	}
+	$base = tmpdir() unless defined $base && length $base;
+
+	return catfile( $base, 'langid' );
+}
+
+# Location of the model file. LANGID_MODEL_PATH / model_path_override() take
+# precedence; otherwise the file lives in the cache directory.
+sub model_path {
+	my ($class) = @_;
+
+	return $MODEL_PATH_OVERRIDE
+		if defined $MODEL_PATH_OVERRIDE && length $MODEL_PATH_OVERRIDE;
+
+	return $ENV{LANGID_MODEL_PATH}
+		if defined $ENV{LANGID_MODEL_PATH} && length $ENV{LANGID_MODEL_PATH};
+
+	return catfile( $class->model_cache_dir(), $MODEL_FILENAME );
+}
+
+# --- test hooks -----------------------------------------------------------
+
+sub model_path_override {
+	my ( $class, $path ) = @_;
+
+	$MODEL_PATH_OVERRIDE = $path;
+
+	return;
+}
+
+sub set_model_fetcher {
+	my ( $class, $fetcher ) = @_;
+
+	$MODEL_FETCHER = $fetcher;
+
+	return;
+}
+
+sub set_model_verifier {
+	my ( $class, $verifier ) = @_;
+
+	$MODEL_VERIFIER = $verifier;
+
+	return;
+}
+
+# --- verification ---------------------------------------------------------
+
+# True when $path is a complete, verified lid.176.ftz model.
+sub _verify_model_file {
+	my ( $class, $path ) = @_;
+
+	return 0 unless defined $path && length $path && -f $path;
+
+	if ($MODEL_VERIFIER) {
+		my $accepted = eval { $MODEL_VERIFIER->($path) };
+
+		return $accepted ? 1 : 0;
+	}
+
+	return 0 unless ( -s $path ) == $MODEL_SIZE;
+
+	my $digest = eval {
+		open my $handle, '<:raw', $path or die "cannot open $path: $!";
+		my $sha = Digest::SHA->new(256);
+		$sha->addfile($handle);
+		close $handle;
+		$sha->hexdigest;
+	};
+
+	return 0 unless defined $digest;
+
+	return $digest eq $MODEL_SHA256 ? 1 : 0;
+}
+
+# Public helper: is the model currently available?
+sub model_available {
+	my ($class) = @_;
+
+	return $class->_verify_model_file( $class->model_path ) ? 1 : 0;
+}
+
+# --- download orchestration ----------------------------------------------
+
+# Ensure the model exists and is verified, downloading it once if needed.
+# $callback->($model_path_or_undef) is invoked exactly once. Concurrent calls
+# for the same path share one download.
+sub ensure_model {
+	my ( $class, $callback ) = @_;
+
+	$callback = sub { } unless ref $callback eq 'CODE';
+
+	my $path = $class->model_path;
+
+	if ( $class->_verify_model_file($path) ) {
+		$callback->($path);
+
+		return;
+	}
+
+	if ( $MODEL_DOWNLOADS{$path} ) {
+		push @{ $MODEL_DOWNLOADS{$path}{waiters} }, $callback;
+
+		return;
+	}
+
+	my $job = {
+		waiters => [$callback],
+		temp    => undef,
+		timer   => undef,
+	};
+
+	$MODEL_DOWNLOADS{$path} = $job;
+
+	$class->_start_model_download( $path, $job );
+
+	return;
+}
+
+sub _start_model_download {
+	my ( $class, $path, $job ) = @_;
+
+	my $directory = File::Basename::dirname($path);
+
+	my $directory_ok = eval {
+		File::Path::make_path($directory) unless -d $directory;
+		1;
+	};
+
+	unless ( $directory_ok && -d $directory ) {
+		_warn_model("cannot create fastText model directory $directory: $@");
+		$class->_finish_model_download( $path, undef );
+
+		return;
+	}
+
+	my $temp = sprintf( '%s.part-%d-%d', $path, $$, int( rand(1_000_000) ) );
+	$job->{temp} = $temp;
+
+	$job->{timer} = AnyEvent->timer(
+		after => $MODEL_FETCH_TIMEOUT,
+		cb    => sub {
+			return unless $MODEL_DOWNLOADS{$path};
+
+			_warn_model( 'fastText model download timed out after '
+				. $MODEL_FETCH_TIMEOUT . 's' );
+			$class->_finish_model_download( $path, undef );
+
+			return;
+		},
+	);
+
+	my $completed = 0;
+
+	my $on_download = sub {
+		my ( $ok, $error ) = @_;
+
+		return if $completed;
+		$completed = 1;
+
+		return unless $MODEL_DOWNLOADS{$path};
+
+		if ( !$ok ) {
+			my $detail = _trim( $error || 'unknown error', 200 );
+			_warn_model("fastText model download failed: $detail");
+			$class->_finish_model_download( $path, undef );
+
+			return;
+		}
+
+		unless ( $class->_verify_model_file($temp) ) {
+			_warn_model('downloaded fastText model failed size/SHA-256 verification');
+			$class->_finish_model_download( $path, undef );
+
+			return;
+		}
+
+		chmod 0644, $temp;
+		unless ( rename $temp, $path ) {
+			_warn_model("cannot move downloaded fastText model to $path: $!");
+			$class->_finish_model_download( $path, undef );
+
+			return;
+		}
+
+		$job->{temp} = undef;
+		$class->_finish_model_download( $path, $path );
+
+		return;
+	};
+
+	my $fetcher = $MODEL_FETCHER || \&_default_model_fetcher;
+
+	my $started = eval {
+		$fetcher->( $class->model_url, $temp, $on_download );
+		1;
+	};
+
+	unless ($started) {
+		$on_download->( 0, "could not start the download: $@" );
+	}
+
+	return;
+}
+
+sub _finish_model_download {
+	my ( $class, $path, $model_path ) = @_;
+
+	my $job = delete $MODEL_DOWNLOADS{$path};
+	return unless $job;
+
+	undef $job->{timer} if $job->{timer};
+
+	if ( defined $job->{temp} && -e $job->{temp} ) {
+		unlink $job->{temp};
+	}
+
+	my @waiters = @{ $job->{waiters} || [] };
+	@{ $job->{waiters} } = ();
+
+	foreach my $callback (@waiters) {
+		my $ok = eval { $callback->($model_path); 1 };
+		_warn_model( 'model download callback failed: ' . _trim( $@, 200 ) ) unless $ok;
+	}
+
+	return;
+}
+
+# Default downloader: Slim::Networking::SimpleAsyncHTTP, 30 s timeout. It only
+# writes the response to $temp; verification and the atomic rename happen in
+# _start_model_download().
+sub _default_model_fetcher {
+	my ( $url, $temp, $done ) = @_;
+
+	my $available = eval {
+		require Slim::Networking::SimpleAsyncHTTP;
+		1;
+	};
+
+	unless ($available) {
+		$done->( 0, 'Slim::Networking::SimpleAsyncHTTP is not available' );
+
+		return;
+	}
+
+	my $completed = 0;
+
+	my $finish = sub {
+		my ( $ok, $error ) = @_;
+
+		return if $completed;
+		$completed = 1;
+
+		$done->( $ok, $error );
+
+		return;
+	};
+
+	my $http = Slim::Networking::SimpleAsyncHTTP->new(
+		sub {
+			my $response = shift;
+			my $content  = eval { $response->content };
+
+			my $written = eval {
+				open my $handle, '>:raw', $temp or die "cannot open $temp: $!";
+				print {$handle} $content;
+				close $handle;
+				1;
+			};
+
+			if ( !$written ) {
+				$finish->( 0, 'cannot write downloaded model: ' . _trim( $@, 200 ) );
+
+				return;
+			}
+
+			$finish->( 1, undef );
+
+			return;
+		},
+		sub {
+			my ( $response, $error ) = @_;
+
+			$finish->( 0, $error || 'network error' );
+
+			return;
+		},
+		{ timeout => $MODEL_FETCH_TIMEOUT },
+	);
+
+	$http->get($url);
+
+	return;
+}
+
+# --- logging --------------------------------------------------------------
+
+sub _model_log {
+	return $MODEL_LOG if $MODEL_LOG;
+
+	my $log;
+	if ( eval { require Slim::Utils::Log; 1 } ) {
+		$log = eval {
+			Slim::Utils::Log->addLogCategory( {
+				category     => 'plugin.langid',
+				defaultLevel => 'WARN',
+				description  => 'PLUGIN_LANGID',
+			} );
+		};
+	}
+
+	$MODEL_LOG = $log || 0;
+
+	return $MODEL_LOG || undef;
+}
+
+sub _warn_model {
+	my ($message) = @_;
+
+	$message = "LangID: $message";
+
+	my $log = _model_log();
+
+	if ( $log && $log->can('warn') ) {
+		$log->warn($message);
+
+		return;
+	}
+
+	warn "$message\n";
+
+	return;
+}
+
+# Asynchronously run both detectors for $target and invoke $callback with
+#   { target => <target>, lingua => { confidence, language, name },
+#     fastlang => { confidence, language, name } | undef }
+# on success, or { error => <message> } on failure.
+#
+# The helper binary is executed as
+#   langid suite --target $target [--model $path]
+# The fastText model is downloaded and verified on first use (see
+# ensure_model()). If it is unavailable, fastlang is undef and the lingua
+# result is still returned.
+sub detect_suite {
+	my ( $class, $text, $target, $callback ) = @_;
+
+	$callback = sub { } unless ref $callback eq 'CODE';
+
+	unless ( defined $target && !ref $target && length $target ) {
+		$callback->( { error => 'detect_suite() requires a target language' } );
+
+		return;
+	}
+
+	my $binary = $class->binary_path;
+
+	unless ( $class->available ) {
+		my $detail = defined $binary && length $binary ? " ($binary)" : '';
+		$callback->( { error => "langid binary is not available$detail" } );
+
+		return;
+	}
+
+	$class->ensure_model(
+		sub {
+			my ($model_path) = @_;
+
+			my @arguments = ( 'suite', '--target', $target );
+			push @arguments, '--model', $model_path
+				if defined $model_path && length $model_path;
+
+			$class->_detect_with_arguments( $text, \@arguments, \&_parse_suite, $callback );
+
+			return;
+		}
+	);
+
+	return;
+}
+
+# Shared asynchronous process plumbing for detect() and detect_suite().
+# Runs $path with @$arguments, writes the normalised $text to stdin, closes it,
+# collects stdout/stderr, enforces the timeout and finally calls
+# $parse->($decoded_json) to produce the result hash passed to $callback.
+sub _detect_with_arguments {
+	my ( $class, $text, $arguments, $parse, $callback ) = @_;
 
 	$callback = sub { } unless ref $callback eq 'CODE';
 
@@ -350,7 +798,7 @@ sub detect {
 	my $stderr_handle = gensym();
 
 	my $pid = eval {
-		IPC::Open3::open3( $stdin_handle, $stdout_handle, $stderr_handle, $path );
+		IPC::Open3::open3( $stdin_handle, $stdout_handle, $stderr_handle, $path, @$arguments );
 	};
 
 	unless ($pid) {
@@ -468,6 +916,21 @@ sub detect {
 		}
 
 		if ( !defined $status || $status != 0 ) {
+			# The suite command reports unsupported targets as a JSON error
+			# object with exit status 2; surface that message to the caller.
+			my $decoded_error = eval { $JSON->decode($output) };
+			my $decode_failed = $@;
+
+			if ( !$decode_failed
+				&& ref $decoded_error eq 'HASH'
+				&& defined $decoded_error->{error}
+				&& !ref $decoded_error->{error} )
+			{
+				$finish->( { error => "$decoded_error->{error}" } );
+
+				return;
+			}
+
 			$finish->( { error => $exit_error->($status) } );
 
 			return;
@@ -483,37 +946,8 @@ sub detect {
 			return;
 		}
 
-		my $name = ( defined $decoded->{language} && !ref $decoded->{language} && length $decoded->{language} )
-			? "$decoded->{language}"
-			: undef;
+		$finish->( $parse->($decoded) );
 
-		# The helper reports null for empty/blank input: no language, no scores.
-		unless ( defined $name ) {
-			$finish->( {
-				language   => undef,
-				name       => undef,
-				iso        => undef,
-				confidence => 0,
-				scores     => [],
-			} );
-
-			return;
-		}
-
-		my $iso = ( defined $decoded->{iso} && !ref $decoded->{iso} && length $decoded->{iso} )
-			? lc $decoded->{iso}
-			: _iso_from_name($name);
-
-		my $raw_scores = ref $decoded->{scores} eq 'ARRAY' ? $decoded->{scores} : [];
-		my @scores     = grep { defined } map { _normalize_score($_) } @$raw_scores;
-
-		$finish->( {
-			language   => $iso,
-			name       => $name,
-			iso        => $iso,
-			confidence => ( defined $decoded->{confidence} && !ref $decoded->{confidence} ) ? 0 + $decoded->{confidence} : 0,
-			scores     => \@scores,
-		} );
 		return;
 	};
 
@@ -532,7 +966,12 @@ sub detect {
 				if ( !defined $written ) {
 					return if $!{EAGAIN} || $!{EWOULDBLOCK} || $!{EINTR};
 
-					$finish->( { error => "failed to write to langid: $!" } );
+					# The child may have exited before reading all of stdin
+					# (for example `langid suite --target fr` reports an
+					# unsupported target immediately). Stop writing, close the
+					# pipe and let the stdout/stderr watchers collect the
+					# child's JSON error or exit status.
+					$close_stdin->();
 
 					return;
 				}
@@ -646,6 +1085,83 @@ sub detect {
 	);
 
 	return;
+}
+
+# Turn the decoded output of the default helper mode into detect()'s public
+# result shape (ISO codes, display names, normalised scores).
+sub _parse_detect {
+	my ($decoded) = @_;
+
+	my $name = ( defined $decoded->{language} && !ref $decoded->{language} && length $decoded->{language} )
+		? "$decoded->{language}"
+		: undef;
+
+	# The helper reports null for empty/blank input: no language, no scores.
+	unless ( defined $name ) {
+		return {
+			language   => undef,
+			name       => undef,
+			iso        => undef,
+			confidence => 0,
+			scores     => [],
+		};
+	}
+
+	my $iso = ( defined $decoded->{iso} && !ref $decoded->{iso} && length $decoded->{iso} )
+		? lc $decoded->{iso}
+		: _iso_from_name($name);
+
+	my $raw_scores = ref $decoded->{scores} eq 'ARRAY' ? $decoded->{scores} : [];
+	my @scores     = grep { defined } map { _normalize_score($_) } @$raw_scores;
+
+	return {
+		language   => $iso,
+		name       => $name,
+		iso        => $iso,
+		confidence => ( defined $decoded->{confidence} && !ref $decoded->{confidence} ) ? 0 + $decoded->{confidence} : 0,
+		scores     => \@scores,
+	};
+}
+
+# Normalise one detector block of the `suite` output.
+sub _normalize_suite_detector {
+	my ($detector) = @_;
+
+	return {
+		confidence => ( defined $detector->{confidence} && !ref $detector->{confidence} ) ? 0 + $detector->{confidence} : 0,
+		language   => ( defined $detector->{language} && !ref $detector->{language} ) ? "$detector->{language}" : undef,
+		name       => ( defined $detector->{name} && !ref $detector->{name} ) ? "$detector->{name}" : undef,
+	};
+}
+
+# Turn the decoded output of `langid suite` into detect_suite()'s result.
+# `fastlang` is null when no fastText model was available, which is a valid
+# result, not an error.
+sub _parse_suite {
+	my ($decoded) = @_;
+
+	my $target = $decoded->{target};
+
+	return { error => 'malformed suite JSON from langid: missing target' }
+		unless defined $target && !ref $target && length $target;
+
+	return { error => 'malformed suite JSON from langid: missing lingua result' }
+		unless ref $decoded->{lingua} eq 'HASH';
+
+	my $fastlang;
+
+	if ( defined $decoded->{fastlang} ) {
+		return { error => 'malformed suite JSON from langid: fastlang must be an object or null' }
+			unless ref $decoded->{fastlang} eq 'HASH';
+
+		$fastlang = _normalize_suite_detector( $decoded->{fastlang} );
+	}
+
+	return {
+		target   => "$target",
+		lingua   => _normalize_suite_detector( $decoded->{lingua} ),
+		fastlang => $fastlang,
+	};
 }
 
 1;

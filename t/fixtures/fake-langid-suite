@@ -1,0 +1,103 @@
+#!/usr/bin/env perl
+
+# Fake langid helper used by t/api.t for the `suite` mode tests.
+#
+# It mimics the model handling of the real binary:
+#   - with --model PATH  -> fastlang object is present
+#   - without --model    -> fastlang is null
+#
+# Behaviour is selected with the FAKE_SUITE_MODE environment variable:
+#
+#   normal   (default)  read stdin and print both detector results
+#   empty              print zero confidences
+#   nofastlang         omit the fastlang field entirely
+#   error              print an unsupported-target JSON error and exit 2
+#   crash              print an error to stderr and exit 3
+#   badjson            print text that is not JSON and exit 0
+#
+# If FAKE_SUITE_ARGS_FILE is set, every invocation appends its arguments
+# (space separated) to that file, so tests can verify --model forwarding.
+
+use strict;
+use warnings;
+
+my @arguments = @ARGV;
+
+if ( defined $ENV{FAKE_SUITE_ARGS_FILE} && length $ENV{FAKE_SUITE_ARGS_FILE} ) {
+	open my $args_handle, '>>', $ENV{FAKE_SUITE_ARGS_FILE} or die "cannot append args: $!";
+	print {$args_handle} join( ' ', @arguments ), "\n";
+	close $args_handle;
+}
+
+my ( $target, $model );
+
+for ( my $index = 0; $index < @arguments; $index++ ) {
+	if ( $arguments[$index] eq '--target' ) {
+		$target = defined $arguments[ $index + 1 ] ? $arguments[ $index + 1 ] : '';
+	}
+	elsif ( $arguments[$index] eq '--model' ) {
+		$model = defined $arguments[ $index + 1 ] ? $arguments[ $index + 1 ] : '';
+	}
+}
+
+my $mode = defined $ENV{FAKE_SUITE_MODE} && length $ENV{FAKE_SUITE_MODE}
+	? $ENV{FAKE_SUITE_MODE}
+	: 'normal';
+
+if ( $mode eq 'error' ) {
+	print qq({"error":"unsupported target: $target"}\n);
+	exit 2;
+}
+
+if ( $mode eq 'crash' ) {
+	print STDERR "fake suite crash\n";
+	exit 3;
+}
+
+if ( $mode eq 'badjson' ) {
+	print "not json\n";
+	exit 0;
+}
+
+# Read stdin; the wrapper must close it or this blocks until its timeout.
+my $input = do { local $/; <STDIN> };
+$input = '' unless defined $input;
+
+my ( $iso, $name );
+
+if ( $target =~ m{\Azh(?:-|$)}i || $target =~ m{\Acmn\z}i ) {
+	( $iso, $name ) = ( 'zh', 'Chinese' );
+}
+elsif ( $target =~ m{\Aen(?:-|$)}i ) {
+	( $iso, $name ) = ( 'en', 'English' );
+}
+elsif ( $target =~ m{\Aja(?:-|$)}i ) {
+	( $iso, $name ) = ( 'ja', 'Japanese' );
+}
+elsif ( $target =~ m{\Ako(?:-|$)}i ) {
+	( $iso, $name ) = ( 'ko', 'Korean' );
+}
+else {
+	print qq({"error":"unsupported target: $target"}\n);
+	exit 2;
+}
+
+my $confidence = $mode eq 'empty' ? 0 : 0.99;
+my $fastlang   = $mode eq 'empty' ? 0 : 0.97;
+
+my $lingua_json = qq({"confidence":$confidence,"language":"$iso","name":"$name"});
+
+if ( $mode eq 'nofastlang' ) {
+	print qq({"target":"$target","lingua":$lingua_json}\n);
+	exit 0;
+}
+
+if ( defined $model && length $model ) {
+	print qq({"target":"$target","lingua":$lingua_json,)
+		. qq("fastlang":{"confidence":$fastlang,"language":"$iso","name":"$name"}}\n);
+}
+else {
+	print qq({"target":"$target","lingua":$lingua_json,"fastlang":null}\n);
+}
+
+exit 0;

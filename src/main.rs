@@ -29,7 +29,17 @@ use std::env;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
+use fasttext_pure_rs::{FastText, Prediction};
 use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
+
+/// Number of fastText predictions requested by the `suite` command.
+pub const FASTLANG_TOP_K: usize = 8;
+
+/// Official location of the fastText language-identification model. The model
+/// is *not* embedded in the binary any more; the Perl wrapper downloads it on
+/// demand and passes it with `--model`. This URL is only used for help text
+/// and documentation.
+pub const MODEL_URL: &str = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz";
 
 /// Maximum number of characters handed to the detector. lingua slows down on
 /// very long input and the extra text does not improve accuracy, so the input
@@ -47,6 +57,7 @@ pub const EXIT_INTERNAL: u8 = 3;
 
 const USAGE: &str = "\
 Usage: langid [OPTIONS] < TEXT
+       langid suite --target <target> < TEXT
 
 Reads UTF-8 text from standard input and prints language confidence values as
 a single JSON object. The detector contains only the language models that were
@@ -58,6 +69,17 @@ Options:
   --languages         print the compiled ISO 639-1 codes as a JSON array
   --version           print the version and exit
   -h, --help          show this help
+
+Commands:
+  suite --target LANG compare lingua-rs and the fastText model for LANG and
+                      print one JSON object per line:
+                      {\"target\":\"zh-Hans\",\"lingua\":{...},\"fastlang\":{...}}
+                      Supported targets: zh, zh-Hans, zh-Hant, cmn, en, ja, ko
+                      --model PATH  fastText lid.176.ftz model file. Without a
+                                    usable model fastlang is null and only the
+                                    lingua result is reported. The model is not
+                                    embedded; LANGID_MODEL_PATH can provide a
+                                    default path.
 ";
 
 /// Parsed command-line options.
@@ -68,6 +90,9 @@ pub struct Config {
     pub languages: bool,
     pub version: bool,
     pub help: bool,
+    pub suite: bool,
+    pub target: Option<String>,
+    pub model: Option<String>,
 }
 
 impl Default for Config {
@@ -78,6 +103,9 @@ impl Default for Config {
             languages: false,
             version: false,
             help: false,
+            suite: false,
+            target: None,
+            model: None,
         }
     }
 }
@@ -204,8 +232,135 @@ pub fn languages_json() -> String {
     )
 }
 
-fn parse_top(value: &str) -> Result<usize, String> {
-    value
+/// Target-language description for the `suite` command.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TargetSpec {
+    /// Lowercase ISO 639-1 code reported for both detectors.
+    pub iso: &'static str,
+    /// lingua display name, also used for the fastText result.
+    pub name: &'static str,
+    /// lingua language that is scored against the input.
+    pub language: Language,
+    /// fastText label family: every label that counts as the target language.
+    pub fastlang_labels: &'static [&'static str],
+}
+
+/// Map a `--target` value to the lingua language and fastText label family.
+///
+/// Only the languages handled by the music translation detector are
+/// supported: Chinese (all script/variant spellings), English, Japanese and
+/// Korean. The lookup is case-insensitive. `None` means the target is not
+/// supported or its lingua model was not compiled into this binary.
+pub fn target_spec(target: &str) -> Option<TargetSpec> {
+    match target.trim().to_ascii_lowercase().as_str() {
+        #[cfg(feature = "lang-zh")]
+        "zh" | "zh-hans" | "zh-hant" | "cmn" => Some(TargetSpec {
+            iso: "zh",
+            name: "Chinese",
+            language: Language::Chinese,
+            fastlang_labels: &[
+                "zh", "zh-cn", "zh-tw", "zh-hans", "zh-hant", "cmn", "yue", "wuu",
+            ],
+        }),
+        #[cfg(feature = "lang-en")]
+        "en" => Some(TargetSpec {
+            iso: "en",
+            name: "English",
+            language: Language::English,
+            fastlang_labels: &["en"],
+        }),
+        #[cfg(feature = "lang-ja")]
+        "ja" => Some(TargetSpec {
+            iso: "ja",
+            name: "Japanese",
+            language: Language::Japanese,
+            fastlang_labels: &["ja"],
+        }),
+        #[cfg(feature = "lang-ko")]
+        "ko" => Some(TargetSpec {
+            iso: "ko",
+            name: "Korean",
+            language: Language::Korean,
+            fastlang_labels: &["ko"],
+        }),
+        _ => None,
+    }
+}
+
+/// Load a fastText model from disk. The model is downloaded on demand by the
+/// caller (CLI: `--model` / `LANGID_MODEL_PATH`; Perl wrapper: automatic
+/// verified download to a cache); the helper itself never opens a network
+/// connection.
+pub fn load_fasttext(path: &str) -> Result<FastText, String> {
+    FastText::load(path)
+        .map_err(|error| format!("failed to load the fastText model {path}: {error}"))
+}
+
+/// Strip the fastText label prefix and compare case-insensitively against the
+/// target language family.
+pub fn label_in_family(label: &str, family: &[&str]) -> bool {
+    let code = label.strip_prefix("__label__").unwrap_or(label);
+    family
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(code))
+}
+
+/// Maximum probability among the predictions whose label belongs to
+/// `family`, or `0.0` when the family does not occur in the top-k list.
+///
+/// The probability is clamped to the documented `0.0..=1.0` range: the
+/// pure-Rust fastText implementation computes `exp(log_probability)`, which
+/// can come out a hair above 1.0 for quantized models such as `lid.176.ftz`.
+pub fn best_family_confidence(predictions: &[Prediction], family: &[&str]) -> f64 {
+    predictions
+        .iter()
+        .filter(|prediction| label_in_family(&prediction.label, family))
+        .map(|prediction| (prediction.probability as f64).clamp(0.0, 1.0))
+        .fold(0.0_f64, f64::max)
+}
+
+/// Render the `suite` result object:
+/// `{"target":...,"lingua":{"confidence","language","name"},"fastlang":{...}}`.
+///
+/// `fastlang_confidence` is `None` when no usable fastText model is available;
+/// the field is then rendered as `null` and the lingua result stays intact.
+pub fn suite_json(
+    target: &str,
+    spec: &TargetSpec,
+    lingua_confidence: f64,
+    fastlang_confidence: Option<f64>,
+) -> String {
+    let lingua = format!(
+        "{{\"confidence\":{},\"language\":{},\"name\":{}}}",
+        lingua_confidence,
+        json_string(spec.iso),
+        json_string(spec.name),
+    );
+
+    let fastlang = match fastlang_confidence {
+        Some(confidence) => format!(
+            "{{\"confidence\":{},\"language\":{},\"name\":{}}}",
+            confidence,
+            json_string(spec.iso),
+            json_string(spec.name),
+        ),
+        None => "null".to_string(),
+    };
+
+    format!(
+        "{{\"target\":{},\"lingua\":{},\"fastlang\":{}}}",
+        json_string(target),
+        lingua,
+        fastlang,
+    )
+}
+
+/// Render an error object for the `suite` command.
+pub fn error_json(message: &str) -> String {
+    format!("{{\"error\":{}}}", json_string(message))
+}
+
+fn parse_top(value: &str) -> Result<usize, String> {    value
         .parse::<usize>()
         .map_err(|_| format!("invalid value for --top: {value}"))
 }
@@ -248,11 +403,28 @@ where
             "--languages" => config.languages = true,
             "--version" | "-V" => config.version = true,
             "-h" | "--help" => config.help = true,
+            "suite" => config.suite = true,
+            "--target" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--target requires a value".to_string())?;
+                config.target = Some(value.as_ref().to_string());
+            }
+            "--model" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--model requires a value".to_string())?;
+                config.model = Some(value.as_ref().to_string());
+            }
             other => {
                 if let Some(value) = other.strip_prefix("--top=") {
                     config.top = parse_top(value)?;
                 } else if let Some(value) = other.strip_prefix("--min-confidence=") {
                     config.min_confidence = parse_min_confidence(value)?;
+                } else if let Some(value) = other.strip_prefix("--target=") {
+                    config.target = Some(value.to_string());
+                } else if let Some(value) = other.strip_prefix("--model=") {
+                    config.model = Some(value.to_string());
                 } else {
                     return Err(format!("unknown option or argument: {other}"));
                 }
@@ -310,6 +482,18 @@ fn run() -> Result<(), u8> {
         return Ok(());
     }
 
+    if config.suite {
+        return run_suite(&config);
+    }
+
+    if config.target.is_some() {
+        println!(
+            "{}",
+            error_json("--target is only valid with the 'suite' command")
+        );
+        return Err(EXIT_USAGE);
+    }
+
     let mut input = String::new();
     if let Err(error) = io::stdin().read_to_string(&mut input) {
         eprintln!("langid: standard input is not valid UTF-8: {error}");
@@ -329,6 +513,91 @@ fn run() -> Result<(), u8> {
     let detector = build_detector();
     let scores = detect_scores(&detector, &text, &config);
     println!("{}", output_json(&scores));
+
+    Ok(())
+}
+
+/// Run the `suite` command: score the stdin text with lingua-rs for the
+/// requested target language and with the embedded fastText model, then print
+/// one JSON object. Unsupported or missing targets produce a JSON error object
+/// and exit status 2.
+fn run_suite(config: &Config) -> Result<(), u8> {
+    let target = match config.target.as_deref() {
+        Some(target) if !target.trim().is_empty() => target.trim().to_string(),
+        _ => {
+            println!(
+                "{}",
+                error_json("the 'suite' command requires --target <target>")
+            );
+            return Err(EXIT_USAGE);
+        }
+    };
+
+    let spec = match target_spec(&target) {
+        Some(spec) => spec,
+        None => {
+            println!("{}", error_json(&format!("unsupported target: {target}")));
+            return Err(EXIT_USAGE);
+        }
+    };
+
+    let mut input = String::new();
+    if let Err(error) = io::stdin().read_to_string(&mut input) {
+        eprintln!("langid: standard input is not valid UTF-8: {error}");
+        return Err(EXIT_INTERNAL);
+    }
+
+    let text = sanitize(&input);
+
+    // `--model` wins; otherwise the documented environment fallback is used.
+    // No model is not an error: the suite then reports `"fastlang":null`.
+    let model_path = config
+        .model
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env::var("LANGID_MODEL_PATH")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        });
+
+    let lingua_confidence = if text.is_empty() {
+        0.0
+    } else {
+        build_detector().compute_language_confidence(text.as_str(), spec.language)
+    };
+
+    // Load the fastText model once. A missing, unreadable or invalid model
+    // only disables the fastlang part of the result; lingua always works.
+    let fastlang_confidence = match model_path.as_deref() {
+        None => {
+            eprintln!(
+                "langid: no fastText model supplied; use --model <path> or LANGID_MODEL_PATH (model: {MODEL_URL})"
+            );
+            None
+        }
+        Some(path) => match load_fasttext(path) {
+            Err(message) => {
+                eprintln!("langid: {message}; continuing without fastlang");
+                None
+            }
+            Ok(_) if text.is_empty() => {
+                // Model is usable, but there is nothing to score.
+                Some(0.0_f64)
+            }
+            Ok(model) => match model.predict(text.as_str(), FASTLANG_TOP_K, 0.0) {
+                Ok(predictions) => {
+                    Some(best_family_confidence(&predictions, spec.fastlang_labels))
+                }
+                Err(_) => Some(0.0_f64),
+            },
+        },
+    };
+
+    println!(
+        "{}",
+        suite_json(&target, &spec, lingua_confidence, fastlang_confidence)
+    );
 
     Ok(())
 }
@@ -393,6 +662,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "lang-en", feature = "lang-zh"))]
     #[test]
     fn result_renders_expected_json() {
         let scores = [(Language::English, 0.9876), (Language::Chinese, 0.0123)];
@@ -509,4 +779,185 @@ mod tests {
         assert_eq!(scores[0].0, Language::English);
         assert_eq!(iso_code(scores[0].0), "en");
     }
+
+    // -----------------------------------------------------------------
+    // suite command: target mapping, fastText extraction, JSON contract
+    // -----------------------------------------------------------------
+
+    #[cfg(feature = "lang-zh")]
+    #[test]
+    fn target_mapping_covers_chinese_variants() {
+        for target in ["zh", "zh-Hans", "zh-Hant", "cmn", "ZH-hans", " zh "] {
+            let spec = target_spec(target).unwrap_or_else(|| panic!("target {target}"));
+            assert_eq!(spec.iso, "zh");
+            assert_eq!(spec.name, "Chinese");
+            assert_eq!(spec.language, Language::Chinese);
+            for label in [
+                "__label__zh",
+                "__label__zh-cn",
+                "__label__zh-tw",
+                "__label__zh-hans",
+                "__label__zh-hant",
+                "__label__cmn",
+                "__label__yue",
+                "__label__wuu",
+            ] {
+                assert!(
+                    label_in_family(label, spec.fastlang_labels),
+                    "{label} should belong to the zh family"
+                );
+            }
+            assert!(!label_in_family("__label__en", spec.fastlang_labels));
+        }
+    }
+
+    #[cfg(feature = "lang-en")]
+    #[test]
+    fn target_mapping_covers_english() {
+        let spec = target_spec("en").expect("en target");
+        assert_eq!(spec.iso, "en");
+        assert_eq!(spec.name, "English");
+        assert_eq!(spec.language, Language::English);
+        assert!(label_in_family("__label__en", spec.fastlang_labels));
+        assert!(!label_in_family("__label__de", spec.fastlang_labels));
+    }
+
+    #[cfg(feature = "lang-ja")]
+    #[test]
+    fn target_mapping_covers_japanese() {
+        let spec = target_spec("ja").expect("ja target");
+        assert_eq!(spec.iso, "ja");
+        assert_eq!(spec.name, "Japanese");
+        assert_eq!(spec.language, Language::Japanese);
+    }
+
+    #[cfg(feature = "lang-ko")]
+    #[test]
+    fn target_mapping_covers_korean() {
+        let spec = target_spec("ko").expect("ko target");
+        assert_eq!(spec.iso, "ko");
+        assert_eq!(spec.name, "Korean");
+        assert_eq!(spec.language, Language::Korean);
+    }
+
+    #[test]
+    fn target_mapping_rejects_unsupported_targets() {
+        assert!(target_spec("fr").is_none());
+        assert!(target_spec("de-DE").is_none());
+        assert!(target_spec("").is_none());
+        assert!(target_spec("  ").is_none());
+    }
+
+    #[test]
+    fn fastlang_extraction_takes_max_probability_in_family() {
+        let predictions = [
+            Prediction {
+                label: "__label__en".to_string(),
+                probability: 0.90,
+            },
+            Prediction {
+                label: "__label__zh".to_string(),
+                probability: 0.05,
+            },
+            Prediction {
+                label: "__label__zh-cn".to_string(),
+                probability: 0.04,
+            },
+            Prediction {
+                label: "__label__ja".to_string(),
+                probability: 0.01,
+            },
+        ];
+        let zh_family = [
+            "zh", "zh-cn", "zh-tw", "zh-hans", "zh-hant", "cmn", "yue", "wuu",
+        ];
+
+        let confidence = best_family_confidence(&predictions, &zh_family);
+        assert!((confidence - 0.05).abs() < 1e-6, "got {confidence}");
+        assert_eq!(best_family_confidence(&predictions, &["ko"]), 0.0);
+        assert!(label_in_family("__label__ZH-HANS", &zh_family));
+        assert!(!label_in_family("__label__zhx", &zh_family));
+    }
+
+    #[test]
+    fn fastlang_extraction_handles_empty_predictions() {
+        assert_eq!(best_family_confidence(&[], &["en"]), 0.0);
+    }
+
+    #[test]
+    fn fastlang_confidence_is_clamped_to_one() {
+        let predictions = [
+            Prediction {
+                label: "__label__zh".to_string(),
+                probability: 1.000_06,
+            },
+            Prediction {
+                label: "__label__ja".to_string(),
+                probability: -0.5,
+            },
+        ];
+        let confidence = best_family_confidence(&predictions, &["zh"]);
+        assert!((confidence - 1.0).abs() < 1e-12, "got {confidence}");
+        assert_eq!(best_family_confidence(&predictions, &["ja"]), 0.0);
+    }
+
+    #[cfg(feature = "lang-zh")]
+    #[test]
+    fn suite_json_matches_contract() {
+        let spec = target_spec("zh-Hans").expect("zh target");
+        assert_eq!(
+            suite_json("zh-Hans", &spec, 0.99, Some(0.97)),
+            concat!(
+                "{\"target\":\"zh-Hans\",",
+                "\"lingua\":{\"confidence\":0.99,\"language\":\"zh\",\"name\":\"Chinese\"},",
+                "\"fastlang\":{\"confidence\":0.97,\"language\":\"zh\",\"name\":\"Chinese\"}}"
+            )
+        );
+    }
+
+    #[cfg(feature = "lang-zh")]
+    #[test]
+    fn suite_json_without_model_renders_fastlang_null() {
+        let spec = target_spec("zh").expect("zh target");
+        assert_eq!(
+            suite_json("zh", &spec, 1.0, None),
+            concat!(
+                "{\"target\":\"zh\",",
+                "\"lingua\":{\"confidence\":1,\"language\":\"zh\",\"name\":\"Chinese\"},",
+                "\"fastlang\":null}"
+            )
+        );
+    }
+
+    #[test]
+    fn parse_args_reads_suite_command_and_target() {
+        let config = parse_args(["suite", "--target", "zh-Hans"]).expect("valid suite args");
+        assert!(config.suite);
+        assert_eq!(config.target.as_deref(), Some("zh-Hans"));
+        assert_eq!(config.model, None);
+
+        let config = parse_args(["--target=ja", "suite"]).expect("valid suite args");
+        assert!(config.suite);
+        assert_eq!(config.target.as_deref(), Some("ja"));
+
+        let config = parse_args(["suite", "--target", "en", "--model", "/tmp/lid.176.ftz"])
+            .expect("valid suite args");
+        assert_eq!(config.model.as_deref(), Some("/tmp/lid.176.ftz"));
+
+        let config = parse_args(["suite", "--target=en", "--model=/tmp/m.ftz"])
+            .expect("valid suite args");
+        assert_eq!(config.target.as_deref(), Some("en"));
+        assert_eq!(config.model.as_deref(), Some("/tmp/m.ftz"));
+
+        assert!(parse_args(["--target"]).is_err());
+        assert!(parse_args(["--model"]).is_err());
+    }
+
+    #[test]
+    fn fasttext_model_loading_requires_an_existing_file() {
+        let missing = "/nonexistent/lid.176.ftz";
+        let error = load_fasttext(missing).expect_err("missing model must fail");
+        assert!(error.contains(missing), "unexpected error: {error}");
+    }
+
 }

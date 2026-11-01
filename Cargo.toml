@@ -1,6 +1,6 @@
 [package]
 name = "langid"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Offline language identification for the Lyrion Music Server LangID plugin"
 license = "Apache-2.0"
@@ -58,6 +58,11 @@ extended = [
 # Model selection happens exclusively through the features above; the full
 # lingua default set would pull in ~75 model crates and an enormous binary.
 lingua = { version = "1.8.0", default-features = false }
+
+# Pure-Rust fastText inference for the `suite` command. The lid.176.ftz model
+# itself is downloaded on demand, not embedded. MIT licensed, no C/C++
+# dependencies.
+fasttext-pure-rs = "0.1.0"
 
 [profile.release]
 opt-level = 3
